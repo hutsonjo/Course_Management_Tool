@@ -1,0 +1,12 @@
+# Virtual environment
+.venv/
+
+# Byte-compiled files
+__pycache__/
+
+# PyCharm settings
+.idea/
+
+# Files ignored by gcloud
+.gcloudignore
+
