@@ -21,8 +21,10 @@ bucket = storage_client.get_bucket('cs493-hutsonjo')
 USERS = 'users'
 AVATAR = 'avatar'
 COURSES = 'courses'
+ERROR_400 = {'Error': "The request body is invalid"}
 ERROR_401 = {'Error': 'Unauthorized'}
 ERROR_403 = {'Error': "You don't have permission on this resource"}
+ERROR_404 = {'Error': "Not Found"}
 
 CLIENT_ID = 'yjITYspDOY6YE65RV3qDWrbn9YwX63wY'
 CLIENT_SECRET = 'wSFwfgfC6zQ17Dh2bD7ij50I9fg5MpvXc_NJ2goU44OOHhVECZFL9cuzGKGBAIJU'
@@ -125,6 +127,17 @@ def verify_user(req, user_id):
     return user
 
 
+def course_validation(course):
+    required_keys = ['subject', 'number', 'title', 'term', 'instructor_id']
+    if not all(key in course for key in required_keys):
+        raise AuthError(ERROR_400, 400)
+    instructor_id = course['instructor_id']
+    instructor_key = client.key(USERS, instructor_id)
+    instructor = client.get(key=instructor_key)
+    if not instructor or instructor['role'] != 'instructor':
+        raise AuthError(ERROR_400, 400)
+
+
 @app.route('/')
 def index():
     return "Please navigate to /businesses to use this API" \
@@ -146,7 +159,7 @@ def decode_jwt():
 def login_user():
     content = request.get_json()
     if not content['username'] and not content['password']:
-        return {'Error': 'The request body is invalid'}, 400
+        return ERROR_400, 400
     username = content["username"]
     password = content["password"]
     body = {'grant_type': 'password', 'username': username,
@@ -199,7 +212,7 @@ def get_user(user_id):
 def create_update_user_avatar(user_id):
     # 400 series status code routes
     if 'file' not in request.files:
-        return {'Error': "The request body is invalid"}, 400
+        return ERROR_400, 400
     user = verify_user(request, user_id)
 
     # Obtain the file, assign the user id as the file name, and upload it to storage
@@ -226,7 +239,7 @@ def get_user_avatar(user_id):
     try:
         blob.download_to_file(file_obj)
     except NotFound:
-        return {'Error': "Not Found"}, 404
+        return ERROR_404, 404
     file_obj.seek(0)
     return send_file(file_obj, mimetype='image/x-png', download_name=str(user_id))
 
@@ -242,7 +255,7 @@ def delete_user_avatar(user_id):
     try:
         blob.download_to_file(file_obj)
     except NotFound:
-        return {'Error': "Not Found"}, 404
+        return ERROR_404, 404
     blob.delete()
     user.pop('avatar_url', None)
     client.put(user)
@@ -251,8 +264,47 @@ def delete_user_avatar(user_id):
 
 @app.route('/' + COURSES, methods=['POST'])
 def create_course():
+    # Verify admin status via JWT and validate request body
     verify_admin(request)
+    content = request.get_json()
+    course_validation(content)
 
+    # Create new course entity
+    new_key = client.key(COURSES)
+    new_course = datastore.Entity(key=new_key)
+    new_course.update({
+        'subject': content['subject'],
+        'number': content['number'],
+        'title': content['title'],
+        'term': content['term'],
+        'instructor_id': content['instructor_id']
+    })
+    client.put(new_course)
+    new_course['id'] = new_course.key.id
+    return new_course, 201
+
+
+@app.route('/' + COURSES, methods=['GET'])
+def get_courses():
+    # Pull limit and offset parameters from request
+    limit = request.args.get('limit', 3, type=int)
+    offset = request.args.get('offset', 0, type=int)
+
+    # Query for all courses by subject with limit and offset, return
+    query = client.query(kind=COURSES)
+    query.order = ['subject']
+    results = list(query.fetch(limit=limit, offset=offset))
+    return results
+
+
+@app.route('/' + COURSES + '/<:course_id>', methods=['GET'])
+def get_course(course_id):
+    course_key = client.key(COURSES, course_id)
+    course = client.get(key=course_key)
+    if not course:
+        return ERROR_404, 404
+    course['id'] = course_id
+    return course
 
 
 
