@@ -14,6 +14,7 @@ app.secret_key = 'SECRET_KEY'
 client = datastore.Client()
 
 BUSINESSES = 'businesses'
+USERS = 'users'
 ERROR_400 = {'Error': 'The request body is missing at least one of the required attributes'}
 ERROR_403 = {'Error': 'No business with this business_id exists'}
 
@@ -118,9 +119,8 @@ def verify_jwt(request):
 def index():
     return "Please navigate to /businesses to use this API" \
  \
-        # Decode the JWT supplied in the Authorization header
 
-
+# Decode the JWT supplied in the Authorization header
 @app.route('/decode', methods=['GET'])
 def decode_jwt():
     payload = verify_jwt(request)
@@ -131,9 +131,11 @@ def decode_jwt():
 # Request: JSON body with 2 properties with "username" and "password"
 #       of a user registered with this Auth0 domain
 # Response: JSON with the JWT as the value of the property id_token
-@app.route('/users/login', methods=['POST'])
+@app.route('/' + USERS + '/login', methods=['POST'])
 def login_user():
     content = request.get_json()
+    if not content['username'] and not content['password']:
+        return {'Error': 'The request body is invalid'}, 400
     username = content["username"]
     password = content["password"]
     body = {'grant_type': 'password', 'username': username,
@@ -147,6 +149,26 @@ def login_user():
     data = r.json()
     id_token = data.get('id_token', None)
     return {'token': id_token}, 200, {'Content-Type': 'application/json'}
+
+
+@app.route('/' + USERS, methods=['GET'])
+def get_users():
+    payload = verify_jwt(request)
+    admin_id = payload['sub']
+    query = client.query(kind=USERS)
+    query.add_filter('sub', '=', admin_id)
+    query.add_filter('role', '=', 'admin')
+    results = list(query.fetch())
+    if not results:
+        return {'Error': "The JWT is valid but doesn't belong to an admin."}, 403
+    query = client.query(kind=USERS)
+    results = list(query.fetch())
+    return results
+
+
+@app.route('/' + USERS + '/<int:user_id>', methods=['GET'])
+def get_user():
+    payload = verify_jwt(request)
 
 
 if __name__ == '__main__':
