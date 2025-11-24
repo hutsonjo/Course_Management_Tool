@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from google.cloud import datastore
+from google.cloud import datastore, storage
 
 import requests
 import json
@@ -12,11 +12,10 @@ app = Flask(__name__)
 app.secret_key = 'SECRET_KEY'
 
 client = datastore.Client()
+storage_client = storage.Client()
+bucket = storage_client.get_bucket('cs493-hutsonjo')
 
-BUSINESSES = 'businesses'
 USERS = 'users'
-ERROR_400 = {'Error': 'The request body is missing at least one of the required attributes'}
-ERROR_403 = {'Error': 'No business with this business_id exists'}
 
 CLIENT_ID = 'yjITYspDOY6YE65RV3qDWrbn9YwX63wY'
 CLIENT_SECRET = 'wSFwfgfC6zQ17Dh2bD7ij50I9fg5MpvXc_NJ2goU44OOHhVECZFL9cuzGKGBAIJU'
@@ -167,8 +166,34 @@ def get_users():
 
 
 @app.route('/' + USERS + '/<int:user_id>', methods=['GET'])
-def get_user():
+def get_user(user_id):
     payload = verify_jwt(request)
+    user_key = client.key(USERS, user_id)
+    user = client.get(key=user_key)
+    query = client.query(kind=USERS)
+    query.add_filter('role', '=', 'admin')
+    admin_query = list(query.fetch(limit=1))
+    admin = admin_query[0] if admin_query else None
+    if payload['sub'] != admin['sub'] and payload['sub'] != user['sub']:
+        return {'Error': "You don't have permission on this resource"}, 403
+    return user
+
+
+@app.route('/' + USERS + '/<int:user_id>/avatar', methods=['GET'])
+def create_update_user_avatar(user_id):
+    if 'file' not in request.files:
+        return {'Error': "The request body is invalid"}, 400
+    payload = verify_jwt(request)
+    user_key = client.key(USERS, user_id)
+    user = client.get(key=user_key)
+    if payload['sub'] != user['sub']:
+        return {'Error': "You don't have permission on this resource"}, 403
+
+    file_obj = request.files['file']
+    blob = bucket.blob(file_obj.filename)
+    file_obj.seek(0)
+    blob.upload_from_file(file_obj)
+    return {'avatar_url': request.url}
 
 
 if __name__ == '__main__':
