@@ -1,5 +1,8 @@
-from flask import Flask, request, jsonify
+import io
+
+from flask import Flask, request, jsonify, url_for, send_file
 from google.cloud import datastore, storage
+from google.cloud.exceptions import NotFound
 
 import requests
 import json
@@ -16,6 +19,7 @@ storage_client = storage.Client()
 bucket = storage_client.get_bucket('cs493-hutsonjo')
 
 USERS = 'users'
+ERROR_403 = {'Error': "You don't have permission on this resource"}
 
 CLIENT_ID = 'yjITYspDOY6YE65RV3qDWrbn9YwX63wY'
 CLIENT_SECRET = 'wSFwfgfC6zQ17Dh2bD7ij50I9fg5MpvXc_NJ2goU44OOHhVECZFL9cuzGKGBAIJU'
@@ -152,6 +156,7 @@ def login_user():
 
 @app.route('/' + USERS, methods=['GET'])
 def get_users():
+    # Verify valid JWT and admin log in
     payload = verify_jwt(request)
     admin_id = payload['sub']
     query = client.query(kind=USERS)
@@ -159,14 +164,22 @@ def get_users():
     query.add_filter('role', '=', 'admin')
     results = list(query.fetch())
     if not results:
-        return {'Error': "The JWT is valid but doesn't belong to an admin."}, 403
+        return ERROR_403, 403
+
+    # Fetch list of users, return list with only id, role, and sub properties
     query = client.query(kind=USERS)
     results = list(query.fetch())
-    return results
+    return_list = []
+    for entity in results:
+        return_list.append(
+            {'id': entity.id, 'role': entity.role, 'sub': entity.sub}
+        )
+    return return_list
 
 
 @app.route('/' + USERS + '/<int:user_id>', methods=['GET'])
 def get_user(user_id):
+    # Verify valid JWT and fetch target user & admin entities
     payload = verify_jwt(request)
     user_key = client.key(USERS, user_id)
     user = client.get(key=user_key)
@@ -174,26 +187,80 @@ def get_user(user_id):
     query.add_filter('role', '=', 'admin')
     admin_query = list(query.fetch(limit=1))
     admin = admin_query[0] if admin_query else None
+
+    # Ensure requesting user is either admin or target user, return user if so
     if payload['sub'] != admin['sub'] and payload['sub'] != user['sub']:
-        return {'Error': "You don't have permission on this resource"}, 403
+        return ERROR_403, 403
     return user
 
 
-@app.route('/' + USERS + '/<int:user_id>/avatar', methods=['GET'])
+@app.route('/' + USERS + '/<int:user_id>/avatar', methods=['POST'])
 def create_update_user_avatar(user_id):
+    # 400 series status code routes
     if 'file' not in request.files:
         return {'Error': "The request body is invalid"}, 400
     payload = verify_jwt(request)
     user_key = client.key(USERS, user_id)
     user = client.get(key=user_key)
     if payload['sub'] != user['sub']:
-        return {'Error': "You don't have permission on this resource"}, 403
+        return ERROR_403, 403
 
+    # Obtain the file, assign the user id as the file name, and upload it to storage
     file_obj = request.files['file']
-    blob = bucket.blob(file_obj.filename)
+    blob = bucket.blob(str(user_id))
     file_obj.seek(0)
     blob.upload_from_file(file_obj)
-    return {'avatar_url': request.url}
+
+    # Create an avatar url property and add it to user entity
+    avatar_url = url_for('get_user_avatar', user_id=user_id, _external=True)
+    user.update({'avatar_url': avatar_url})
+    client.put(user)
+    return {'avatar_url': avatar_url}
+
+
+@app.route('/' + USERS + '/<int:user_id>/avatar', methods=['GET'])
+def get_user_avatar(user_id):
+    # Verify valid JWT and matching request/target user
+    payload = verify_jwt(request)
+    user_key = client.key(USERS, user_id)
+    user = client.get(key=user_key)
+    if payload['sub'] != user['sub']:
+        return ERROR_403, 403
+
+    # Search for file, returning 404 if not found, returning otherwise
+    blob = bucket.blob(str(user_id))
+    file_obj = io.BytesIO()
+    try:
+        blob.download_to_file(file_obj)
+    except NotFound:
+        return {'Error': "Not Found"}, 404
+    file_obj.seek(0)
+    return send_file(file_obj, mimetype='image/x-png', download_name=str(user_id))
+
+
+@app.route('/' + USERS + '/<int:user_id>/avatar', methods=['DELETE'])
+def delete_user_avatar(user_id):
+    # Verify valid JWT and matching request/target user
+    payload = verify_jwt(request)
+    user_key = client.key(USERS, user_id)
+    user = client.get(key=user_key)
+    if payload['sub'] != user['sub']:
+        return ERROR_403, 403
+
+    # Delete file and remove avatar_url property from corresponding user
+    blob = bucket.blob(str(user_id))
+    file_obj = io.BytesIO()
+    try:
+        blob.download_to_file(file_obj)
+    except NotFound:
+        return {'Error': "Not Found"}, 404
+    blob.delete()
+    user.pop('avatar_url', None)
+    client.put(user)
+    return '', 204
+
+
+
 
 
 if __name__ == '__main__':
