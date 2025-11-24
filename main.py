@@ -19,6 +19,9 @@ storage_client = storage.Client()
 bucket = storage_client.get_bucket('cs493-hutsonjo')
 
 USERS = 'users'
+AVATAR = 'avatar'
+COURSES = 'courses'
+ERROR_401 = {'Error': 'Unauthorized'}
 ERROR_403 = {'Error': "You don't have permission on this resource"}
 
 CLIENT_ID = 'yjITYspDOY6YE65RV3qDWrbn9YwX63wY'
@@ -60,24 +63,16 @@ def verify_jwt(request):
         auth_header = request.headers['Authorization'].split()
         token = auth_header[1]
     else:
-        raise AuthError({"code": "no auth header",
-                         "description":
-                             "Authorization header is missing"}, 401)
+        raise AuthError(ERROR_401, 401)
 
     jsonurl = urlopen("https://" + DOMAIN + "/.well-known/jwks.json")
     jwks = json.loads(jsonurl.read())
     try:
         unverified_header = jwt.get_unverified_header(token)
     except jwt.JWTError:
-        raise AuthError({"code": "invalid_header",
-                         "description":
-                             "Invalid header. "
-                             "Use an RS256 signed JWT Access Token"}, 401)
+        raise AuthError(ERROR_401, 401)
     if unverified_header["alg"] == "HS256":
-        raise AuthError({"code": "invalid_header",
-                         "description":
-                             "Invalid header. "
-                             "Use an RS256 signed JWT Access Token"}, 401)
+        raise AuthError(ERROR_401, 401)
     rsa_key = {}
     for key in jwks["keys"]:
         if key["kid"] == unverified_header["kid"]:
@@ -98,30 +93,43 @@ def verify_jwt(request):
                 issuer="https://" + DOMAIN + "/"
             )
         except jwt.ExpiredSignatureError:
-            raise AuthError({"code": "token_expired",
-                             "description": "token is expired"}, 401)
+            raise AuthError(ERROR_401, 401)
         except jwt.JWTClaimsError:
-            raise AuthError({"code": "invalid_claims",
-                             "description":
-                                 "incorrect claims,"
-                                 " please check the audience and issuer"}, 401)
+            raise AuthError(ERROR_401, 401)
         except Exception:
-            raise AuthError({"code": "invalid_header",
-                             "description":
-                                 "Unable to parse authentication"
-                                 " token."}, 401)
+            raise AuthError(ERROR_401, 401)
 
         return payload
     else:
-        raise AuthError({"code": "no_rsa_key",
-                         "description":
-                             "No RSA key in JWKS"}, 401)
+        raise AuthError(ERROR_401, 401)
+
+
+def verify_admin(req):
+    # Verify valid JWT and admin log in
+    payload = verify_jwt(req)
+    admin_id = payload['sub']
+    query = client.query(kind=USERS)
+    query.add_filter('sub', '=', admin_id)
+    query.add_filter('role', '=', 'admin')
+    results = list(query.fetch())
+    if not results:
+        raise AuthError(ERROR_403, 403)
+
+
+def verify_user(req, user_id):
+    payload = verify_jwt(req)
+    user_key = client.key(USERS, user_id)
+    user = client.get(key=user_key)
+    if payload['sub'] != user['sub']:
+        raise AuthError(ERROR_403, 403)
+    return user
 
 
 @app.route('/')
 def index():
     return "Please navigate to /businesses to use this API" \
  \
+
 
 # Decode the JWT supplied in the Authorization header
 @app.route('/decode', methods=['GET'])
@@ -157,14 +165,7 @@ def login_user():
 @app.route('/' + USERS, methods=['GET'])
 def get_users():
     # Verify valid JWT and admin log in
-    payload = verify_jwt(request)
-    admin_id = payload['sub']
-    query = client.query(kind=USERS)
-    query.add_filter('sub', '=', admin_id)
-    query.add_filter('role', '=', 'admin')
-    results = list(query.fetch())
-    if not results:
-        return ERROR_403, 403
+    verify_admin(request)
 
     # Fetch list of users, return list with only id, role, and sub properties
     query = client.query(kind=USERS)
@@ -194,16 +195,12 @@ def get_user(user_id):
     return user
 
 
-@app.route('/' + USERS + '/<int:user_id>/avatar', methods=['POST'])
+@app.route('/' + USERS + '/<int:user_id>/' + AVATAR, methods=['POST'])
 def create_update_user_avatar(user_id):
     # 400 series status code routes
     if 'file' not in request.files:
         return {'Error': "The request body is invalid"}, 400
-    payload = verify_jwt(request)
-    user_key = client.key(USERS, user_id)
-    user = client.get(key=user_key)
-    if payload['sub'] != user['sub']:
-        return ERROR_403, 403
+    user = verify_user(request, user_id)
 
     # Obtain the file, assign the user id as the file name, and upload it to storage
     file_obj = request.files['file']
@@ -218,14 +215,10 @@ def create_update_user_avatar(user_id):
     return {'avatar_url': avatar_url}
 
 
-@app.route('/' + USERS + '/<int:user_id>/avatar', methods=['GET'])
+@app.route('/' + USERS + '/<int:user_id>/' + AVATAR, methods=['GET'])
 def get_user_avatar(user_id):
     # Verify valid JWT and matching request/target user
-    payload = verify_jwt(request)
-    user_key = client.key(USERS, user_id)
-    user = client.get(key=user_key)
-    if payload['sub'] != user['sub']:
-        return ERROR_403, 403
+    verify_user(request, user_id)
 
     # Search for file, returning 404 if not found, returning otherwise
     blob = bucket.blob(str(user_id))
@@ -238,14 +231,10 @@ def get_user_avatar(user_id):
     return send_file(file_obj, mimetype='image/x-png', download_name=str(user_id))
 
 
-@app.route('/' + USERS + '/<int:user_id>/avatar', methods=['DELETE'])
+@app.route('/' + USERS + '/<int:user_id>/' + AVATAR, methods=['DELETE'])
 def delete_user_avatar(user_id):
     # Verify valid JWT and matching request/target user
-    payload = verify_jwt(request)
-    user_key = client.key(USERS, user_id)
-    user = client.get(key=user_key)
-    if payload['sub'] != user['sub']:
-        return ERROR_403, 403
+    user = verify_user(request, user_id)
 
     # Delete file and remove avatar_url property from corresponding user
     blob = bucket.blob(str(user_id))
@@ -259,6 +248,10 @@ def delete_user_avatar(user_id):
     client.put(user)
     return '', 204
 
+
+@app.route('/' + COURSES, methods=['POST'])
+def create_course():
+    verify_admin(request)
 
 
 
