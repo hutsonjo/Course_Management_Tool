@@ -25,6 +25,7 @@ ERROR_400 = {'Error': "The request body is invalid"}
 ERROR_401 = {'Error': 'Unauthorized'}
 ERROR_403 = {'Error': "You don't have permission on this resource"}
 ERROR_404 = {'Error': "Not Found"}
+ERROR_409 = {"Error": "Enrollment data is invalid"}
 
 CLIENT_ID = 'yjITYspDOY6YE65RV3qDWrbn9YwX63wY'
 CLIENT_SECRET = 'wSFwfgfC6zQ17Dh2bD7ij50I9fg5MpvXc_NJ2goU44OOHhVECZFL9cuzGKGBAIJU'
@@ -106,9 +107,8 @@ def verify_jwt(request):
         raise AuthError(ERROR_401, 401)
 
 
-def verify_admin(req):
+def verify_admin(payload):
     # Verify valid JWT and admin log in
-    payload = verify_jwt(req)
     admin_id = payload['sub']
     query = client.query(kind=USERS)
     query.add_filter('sub', '=', admin_id)
@@ -131,11 +131,24 @@ def course_validation(course):
     required_keys = ['subject', 'number', 'title', 'term', 'instructor_id']
     if not all(key in course for key in required_keys):
         raise AuthError(ERROR_400, 400)
-    instructor_id = course['instructor_id']
-    instructor_key = client.key(USERS, instructor_id)
-    instructor = client.get(key=instructor_key)
-    if not instructor or instructor['role'] != 'instructor':
-        raise AuthError(ERROR_400, 400)
+
+
+def instructor_validation(course):
+    if course['instructor_id']:
+        instructor_id = course['instructor_id']
+        instructor_key = client.key(USERS, instructor_id)
+        instructor = client.get(key=instructor_key)
+        if not instructor or instructor['role'] != 'instructor':
+            raise AuthError(ERROR_400, 400)
+        return instructor
+
+
+def retrieve_admin():
+    query = client.query(kind=USERS)
+    query.add_filter('role', '=', 'admin')
+    admin_query = list(query.fetch(limit=1))
+    admin = admin_query[0] if admin_query else None
+    return admin
 
 
 @app.route('/')
@@ -178,7 +191,8 @@ def login_user():
 @app.route('/' + USERS, methods=['GET'])
 def get_users():
     # Verify valid JWT and admin log in
-    verify_admin(request)
+    payload = verify_jwt(request)
+    verify_admin(payload)
 
     # Fetch list of users, return list with only id, role, and sub properties
     query = client.query(kind=USERS)
@@ -197,10 +211,7 @@ def get_user(user_id):
     payload = verify_jwt(request)
     user_key = client.key(USERS, user_id)
     user = client.get(key=user_key)
-    query = client.query(kind=USERS)
-    query.add_filter('role', '=', 'admin')
-    admin_query = list(query.fetch(limit=1))
-    admin = admin_query[0] if admin_query else None
+    admin = retrieve_admin()
 
     # Ensure requesting user is either admin or target user, return user if so
     if payload['sub'] != admin['sub'] and payload['sub'] != user['sub']:
@@ -265,7 +276,8 @@ def delete_user_avatar(user_id):
 @app.route('/' + COURSES, methods=['POST'])
 def create_course():
     # Verify admin status via JWT and validate request body
-    verify_admin(request)
+    payload = verify_jwt(request)
+    verify_admin(payload)
     content = request.get_json()
     course_validation(content)
 
@@ -281,6 +293,8 @@ def create_course():
     })
     client.put(new_course)
     new_course['id'] = new_course.key.id
+
+
     return new_course, 201
 
 
@@ -299,13 +313,97 @@ def get_courses():
 
 @app.route('/' + COURSES + '/<:course_id>', methods=['GET'])
 def get_course(course_id):
+    # Query to find course with course id param
     course_key = client.key(COURSES, course_id)
     course = client.get(key=course_key)
+
+    # Verify course exists, reply accordingly
     if not course:
         return ERROR_404, 404
     course['id'] = course_id
     return course
 
+
+@app.route('/' + COURSES + '/<:course_id>', methods=['PUT'])
+def put_course(course_id):
+    # Verify JWT, admin status, and valid
+    payload = verify_jwt(request)
+    verify_admin(payload)
+    content = request.get_json()
+    instructor_validation(content)
+
+    # add comment
+    course_key = client.key(COURSES, course_id)
+    course = client.get(key=course_key)
+    if not course:
+        return ERROR_404, 404
+    course.update({
+        'subject': content.get('subject', course.get('subject')),
+        'number': content.get('number', course.get('number')),
+        'title': content.get('title', course.get('title')),
+        'term': content.get('term', course.get('term')),
+        'instructor_id': content.get('instructor_id', course.get('instructor_id'))
+    })
+    client.put(course)
+    course['id'] = course_id
+    return course
+
+
+@app.route('/' + COURSES + '/<:course_id>', methods=['DELETE'])
+def delete_course(course_id):
+    # Verify JWT and that course exists
+    payload = verify_jwt(request)
+    verify_admin(payload)
+    course_key = client.key(COURSES, course_id)
+    course = client.get(key=course_key)
+    if not course:
+        return ERROR_403, 403
+
+    # delete course and send 204
+    client.delete(course_key)
+    return '', 204
+
+
+@app.route('/' + COURSES + '/<:course_id>/students', methods=['PATCH'])
+def patch_course(course_id):
+    # Verify validity of JWT and that the course exists
+    payload = verify_jwt(request)
+    course_key = client.key(COURSES, course_id)
+    course = client.get(key=course_key)
+    if not course:
+        return ERROR_403, 403
+
+    # Validate that the JWT belongs to an admin or the course instructor
+    course.get_json()
+    instructor = instructor_validation(course)
+    instructor.get_json()
+    admin = retrieve_admin()
+    if admin['sub'] != payload['sub'] and instructor['sub'] != payload['sub']:
+        return ERROR_403, 403
+
+    # Validate request content
+    content = request.get_json()
+    if not content['add'] and not content['remove']:
+        return ERROR_409, 409
+
+    # Form course url and add it to any student on the list if not already enrolled & 409 for false user_ids
+    course_url = f'{request.host_url}/courses/{course_id}'
+    for student_id in content['add']:
+        student_key = client.key(USERS, student_id)
+        student = client.get(key=student_key)
+        if not student:
+            return ERROR_409, 409
+        if course_url not in student['courses']:
+            student['courses'].append(course_url)
+
+    # Remove course_url from any student currently enrolled & 409 for false user_ids
+    for student_id in content['remove']:
+        student_key = client.key(USERS, student_id)
+        student = client.get(key=student_key)
+        if not student:
+            return ERROR_409, 409
+        if course_url in student['courses']:
+            student['courses'].remove(course_url)
 
 
 if __name__ == '__main__':
