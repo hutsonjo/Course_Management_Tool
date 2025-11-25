@@ -280,6 +280,7 @@ def create_course():
     verify_admin(payload)
     content = request.get_json()
     course_validation(content)
+    instructor = instructor_validation(content)
 
     # Create new course entity
     new_key = client.key(COURSES)
@@ -294,7 +295,10 @@ def create_course():
     client.put(new_course)
     new_course['id'] = new_course.key.id
 
-
+    # Add course url to list of instructor's courses
+    course_url = f'{request.host_url}courses/{new_course['id']}'
+    instructor['courses'].append(course_url)
+    client.put(instructor)
     return new_course, 201
 
 
@@ -311,7 +315,7 @@ def get_courses():
     return results
 
 
-@app.route('/' + COURSES + '/<:course_id>', methods=['GET'])
+@app.route('/' + COURSES + '/<int:course_id>', methods=['GET'])
 def get_course(course_id):
     # Query to find course with course id param
     course_key = client.key(COURSES, course_id)
@@ -324,7 +328,7 @@ def get_course(course_id):
     return course
 
 
-@app.route('/' + COURSES + '/<:course_id>', methods=['PUT'])
+@app.route('/' + COURSES + '/<int:course_id>', methods=['PUT'])
 def put_course(course_id):
     # Verify JWT, admin status, and valid
     payload = verify_jwt(request)
@@ -332,11 +336,12 @@ def put_course(course_id):
     content = request.get_json()
     instructor_validation(content)
 
-    # add comment
+    # Grab course object and update properties
     course_key = client.key(COURSES, course_id)
     course = client.get(key=course_key)
     if not course:
         return ERROR_404, 404
+    old_instructor_id = course['instructor_id']  # Grabbing old instructor id here as it is an optional parameter
     course.update({
         'subject': content.get('subject', course.get('subject')),
         'number': content.get('number', course.get('number')),
@@ -344,12 +349,27 @@ def put_course(course_id):
         'term': content.get('term', course.get('term')),
         'instructor_id': content.get('instructor_id', course.get('instructor_id'))
     })
+
+    # If instructor has been changed, update old/new instructor courses accordingly
+    new_instructor_id = course['instructor_id']
+    course_url = f'{request.host_url}courses/{course_id}'
+    if new_instructor_id != old_instructor_id:
+        old_instructor_key = client.key(USERS, old_instructor_id)
+        old_instructor = client.get(key=old_instructor_key)
+        old_instructor['courses'].remove(course_url)
+        client.put(old_instructor)
+        new_instructor_key = client.key(USERS, new_instructor_id)
+        new_instructor = client.get(key=new_instructor_key)
+        new_instructor['courses'].append(course_url)
+        client.put(new_instructor)
+
+    # Update course and return with id
     client.put(course)
     course['id'] = course_id
     return course
 
 
-@app.route('/' + COURSES + '/<:course_id>', methods=['DELETE'])
+@app.route('/' + COURSES + '/<int:course_id>', methods=['DELETE'])
 def delete_course(course_id):
     # Verify JWT and that course exists
     payload = verify_jwt(request)
@@ -359,12 +379,16 @@ def delete_course(course_id):
     if not course:
         return ERROR_403, 403
 
-    # delete course and send 204
+    # Remove from instructor's courses, delete course, and send 204
+    course_url = f'{request.host_url}courses/{course_id}'
+    instructor = instructor_validation(course)
+    instructor['courses'].remove(course_url)
+    client.put(instructor)
     client.delete(course_key)
     return '', 204
 
 
-@app.route('/' + COURSES + '/<:course_id>/students', methods=['PATCH'])
+@app.route('/' + COURSES + '/<int:course_id>/students', methods=['PATCH'])
 def patch_course(course_id):
     # Verify validity of JWT and that the course exists
     payload = verify_jwt(request)
@@ -374,36 +398,42 @@ def patch_course(course_id):
         return ERROR_403, 403
 
     # Validate that the JWT belongs to an admin or the course instructor
-    course.get_json()
     instructor = instructor_validation(course)
-    instructor.get_json()
     admin = retrieve_admin()
-    if admin['sub'] != payload['sub'] and instructor['sub'] != payload['sub']:
+    if payload['sub'] not in (instructor['sub'], admin['sub']):
         return ERROR_403, 403
 
     # Validate request content
     content = request.get_json()
-    if not content['add'] and not content['remove']:
+    if 'add' not in content and 'remove' not in content:
+        return ERROR_409, 409
+    if not isinstance(content['add'], list) or not isinstance(content['remove'], list):
+        return ERROR_409, 409
+    if set(content['add']) & set(content['remove']):
         return ERROR_409, 409
 
     # Form course url and add it to any student on the list if not already enrolled & 409 for false user_ids
-    course_url = f'{request.host_url}/courses/{course_id}'
+    course_url = f'{request.host_url}courses/{course_id}'
     for student_id in content['add']:
-        student_key = client.key(USERS, student_id)
-        student = client.get(key=student_key)
-        if not student:
-            return ERROR_409, 409
-        if course_url not in student['courses']:
-            student['courses'].append(course_url)
+        with client.transaction():
+            student_key = client.key(USERS, student_id)
+            student = client.get(key=student_key)
+            if not student:
+                return ERROR_409, 409
+            if course_url not in student['courses']:
+                student['courses'].append(course_url)
+                client.put(student)
 
     # Remove course_url from any student currently enrolled & 409 for false user_ids
     for student_id in content['remove']:
-        student_key = client.key(USERS, student_id)
-        student = client.get(key=student_key)
-        if not student:
-            return ERROR_409, 409
-        if course_url in student['courses']:
-            student['courses'].remove(course_url)
+        with client.transaction():
+            student_key = client.key(USERS, student_id)
+            student = client.get(key=student_key)
+            if not student:
+                return ERROR_409, 409
+            if course_url in student['courses']:
+                student['courses'].remove(course_url)
+                client.put(student)
 
 
 if __name__ == '__main__':
