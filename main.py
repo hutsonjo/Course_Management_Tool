@@ -14,7 +14,7 @@ from authlib.integrations.flask_client import OAuth
 app = Flask(__name__)
 app.secret_key = 'SECRET_KEY'
 
-client = datastore.Client()
+client = datastore.Client(project='hutsonjo-assignment6')
 storage_client = storage.Client()
 bucket = storage_client.get_bucket('cs493-hutsonjo')
 
@@ -24,7 +24,7 @@ COURSES = 'courses'
 ERROR_400 = {'Error': "The request body is invalid"}
 ERROR_401 = {'Error': 'Unauthorized'}
 ERROR_403 = {'Error': "You don't have permission on this resource"}
-ERROR_404 = {'Error': "Not Found"}
+ERROR_404 = {'Error': "Not found"}
 ERROR_409 = {"Error": "Enrollment data is invalid"}
 
 CLIENT_ID = 'yjITYspDOY6YE65RV3qDWrbn9YwX63wY'
@@ -153,7 +153,7 @@ def retrieve_admin():
 
 @app.route('/')
 def index():
-    return "Please navigate to /businesses to use this API" \
+    return "CS493 Assignment 6 Hutsonjo" \
  \
 
 
@@ -171,7 +171,9 @@ def decode_jwt():
 @app.route('/' + USERS + '/login', methods=['POST'])
 def login_user():
     content = request.get_json()
-    if not content['username'] and not content['password']:
+    if 'username' not in content or 'password' not in content:
+        return ERROR_400, 400
+    if not content['username'] or not content['password']:
         return ERROR_400, 400
     username = content["username"]
     password = content["password"]
@@ -185,6 +187,8 @@ def login_user():
     r = requests.post(url, json=body, headers=headers)
     data = r.json()
     id_token = data.get('id_token', None)
+    if not id_token:
+        return ERROR_401, 401
     return {'token': id_token}, 200, {'Content-Type': 'application/json'}
 
 
@@ -200,7 +204,7 @@ def get_users():
     return_list = []
     for entity in results:
         return_list.append(
-            {'id': entity.id, 'role': entity.role, 'sub': entity.sub}
+            {'id': entity.id, 'role': entity['role'], 'sub': entity['sub']}
         )
     return return_list
 
@@ -216,6 +220,7 @@ def get_user(user_id):
     # Ensure requesting user is either admin or target user, return user if so
     if payload['sub'] != admin['sub'] and payload['sub'] != user['sub']:
         return ERROR_403, 403
+    user['id'] = user.key.id
     return user
 
 
@@ -294,6 +299,7 @@ def create_course():
     })
     client.put(new_course)
     new_course['id'] = new_course.key.id
+    new_course['self'] = f'{request.base_url}/{new_course.key.id}'
 
     # Add course url to list of instructor's courses
     course_url = f'{request.host_url}courses/{new_course['id']}'
@@ -312,7 +318,12 @@ def get_courses():
     query = client.query(kind=COURSES)
     query.order = ['subject']
     results = list(query.fetch(limit=limit, offset=offset))
-    return results
+    for course in results:
+        course['id'] = course.key.id
+        course['self'] = request.base_url + '/' + str(course.key.id)
+    offset = offset + limit
+    next_url = f'{request.base_url}?offset={offset}&limit={limit}'
+    return {'courses': results, 'next': next_url}
 
 
 @app.route('/' + COURSES + '/<int:course_id>', methods=['GET'])
@@ -325,6 +336,7 @@ def get_course(course_id):
     if not course:
         return ERROR_404, 404
     course['id'] = course_id
+    course['self'] = request.base_url
     return course
 
 
@@ -366,6 +378,7 @@ def put_course(course_id):
     # Update course and return with id
     client.put(course)
     course['id'] = course_id
+    course['self'] = request.base_url
     return course
 
 
@@ -414,26 +427,61 @@ def patch_course(course_id):
 
     # Form course url and add it to any student on the list if not already enrolled & 409 for false user_ids
     course_url = f'{request.host_url}courses/{course_id}'
+    student_list = []
     for student_id in content['add']:
         with client.transaction():
             student_key = client.key(USERS, student_id)
             student = client.get(key=student_key)
             if not student:
                 return ERROR_409, 409
-            if course_url not in student['courses']:
-                student['courses'].append(course_url)
-                client.put(student)
+            student_list.append(student)
+
+    for student in student_list:
+        if course_url not in student['courses']:
+            student['courses'].append(course_url)
+            client.put(student)
 
     # Remove course_url from any student currently enrolled & 409 for false user_ids
+    student_list = []
     for student_id in content['remove']:
         with client.transaction():
             student_key = client.key(USERS, student_id)
             student = client.get(key=student_key)
             if not student:
                 return ERROR_409, 409
-            if course_url in student['courses']:
-                student['courses'].remove(course_url)
-                client.put(student)
+            student_list.append(student)
+
+    for student in student_list:
+        if course_url in student['courses']:
+            student['courses'].remove(course_url)
+            client.put(student)
+
+    return '', 200
+
+
+@app.route('/' + COURSES + '/<int:course_id>/students', methods=['GET'])
+def get_enrollment(course_id):
+    # Verify validity of JWT and that the course exists
+    payload = verify_jwt(request)
+    course_key = client.key(COURSES, course_id)
+    course = client.get(key=course_key)
+    if not course:
+        return ERROR_403, 403
+
+    # Validate that the JWT belongs to an admin or the course instructor
+    instructor = instructor_validation(course)
+    admin = retrieve_admin()
+    if payload['sub'] not in (instructor['sub'], admin['sub']):
+        return ERROR_403, 403
+
+    course_url = f'{request.host_url}courses/{course_id}'
+    query = client.query(kind=USERS)
+    results = list(query.fetch())
+    return_list = []
+    for student in results:
+        if 'courses' in student and course_url in student['courses']:
+            return_list.append(student.key.id)
+    return return_list
 
 
 if __name__ == '__main__':
